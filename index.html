@@ -704,6 +704,50 @@ async function load() {
 }
 
 // ═══════════════════════════════════════════════
+//  REAL-TIME SYNC (SSE + Page Visibility)
+// ═══════════════════════════════════════════════
+let _sseSource = null;
+let _pendingReload = false;
+
+function connectSSE() {
+  if (_sseSource) _sseSource.close();
+  _sseSource = new EventSource(`${API}/events`);
+
+  _sseSource.addEventListener('data-changed', () => {
+    const active = document.activeElement;
+    if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) {
+      _pendingReload = true;
+      return;
+    }
+    _reloadFromServer();
+  });
+
+  _sseSource.onerror = () => {
+    // EventSource auto-reconnects; no manual retry needed
+  };
+}
+
+document.addEventListener('focusout', () => {
+  if (_pendingReload) {
+    _pendingReload = false;
+    _reloadFromServer();
+  }
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    _reloadFromServer();
+  }
+});
+
+async function _reloadFromServer() {
+  await load();
+  recalcAll();
+  renderBills();
+  renderSettings();
+}
+
+// ═══════════════════════════════════════════════
 //  MONTH KEY
 // ═══════════════════════════════════════════════
 function monthKey() {
@@ -2246,6 +2290,7 @@ async function init() {
   hideBanner();
   renderBills();
   recalcAll();
+  connectSSE();
 }
 
 function showBanner(msg, type) {

@@ -55,6 +55,17 @@ const stmts = {
   setEmailCfg:  db.prepare('INSERT OR REPLACE INTO email_config (user_id, config, updated_at) VALUES (?, ?, unixepoch())'),
 };
 
+// ── SSE client tracking ───────────────────────────────────────────────────────
+const sseClients = new Map(); // userId -> Set of res objects
+
+function broadcastChange(userId) {
+  const clients = sseClients.get(userId);
+  if (!clients) return;
+  for (const res of clients) {
+    res.write('event: data-changed\ndata: {}\n\n');
+  }
+}
+
 // ── Middleware ────────────────────────────────────────────────────────────────
 app.use(express.json({ limit: '2mb' }));
 
@@ -108,11 +119,13 @@ app.put('/api/state', (req, res) => {
   });
   saveMany(req.userId, body);
   res.json({ ok: true });
+  broadcastChange(req.userId);
 });
 
 app.patch('/api/state/:key', (req, res) => {
   stmts.setState.run(req.userId, req.params.key, JSON.stringify(req.body));
   res.json({ ok: true });
+  broadcastChange(req.userId);
 });
 
 // ── Monthly data API ──────────────────────────────────────────────────────────
@@ -134,11 +147,13 @@ app.put('/api/months/:key', (req, res) => {
   if (!/^\d{4}-\d{2}$/.test(key)) return res.status(400).json({ error: 'Invalid month key (expected YYYY-MM)' });
   stmts.setMonth.run(req.userId, key, JSON.stringify(req.body));
   res.json({ ok: true });
+  broadcastChange(req.userId);
 });
 
 app.delete('/api/months/:key', (req, res) => {
   stmts.deleteMonth.run(req.userId, req.params.key);
   res.json({ ok: true });
+  broadcastChange(req.userId);
 });
 
 // ── Export / Import ───────────────────────────────────────────────────────────
@@ -159,6 +174,7 @@ app.post('/api/import', (req, res) => {
   });
   importAll(req.userId, state, monthly);
   res.json({ ok: true });
+  broadcastChange(req.userId);
 });
 
 
@@ -241,6 +257,22 @@ app.post('/api/email/send', async (req, res) => {
     console.error('Email send failed:', e.message);
     res.status(500).json({ error: e.message });
   }
+});
+
+// ── SSE event stream ─────────────────────────────────────────────────────────
+app.get('/api/events', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+  res.write('event: connected\ndata: {}\n\n');
+
+  if (!sseClients.has(req.userId)) sseClients.set(req.userId, new Set());
+  sseClients.get(req.userId).add(res);
+
+  req.on('close', () => {
+    sseClients.get(req.userId)?.delete(res);
+  });
 });
 
 // ── SPA fallback — serve index.html for any non-API route ────────────────────
