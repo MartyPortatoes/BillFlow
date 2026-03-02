@@ -920,7 +920,7 @@ function renderBillBody(bill) {
             <select onchange="updateLinePersonId('${bill.id}','${line.id}',this.value)">
               ${S.people.map(p=>`<option value="${p.id}" ${p.id===line.personId?'selected':''}>${p.name}</option>`).join('')}
             </select>
-            <input type="number" value="${line.value}" min="0" max="100" step="0.1"
+            <input type="number" value="${+line.value.toFixed(2)}" min="0" max="100" step="0.1"
                    oninput="updateLinePct('${bill.id}','${line.id}',this.value)"
                    style="text-align:right;font-size:12px;">
             <div class="line-item-owed ${line.personId==='me'?'is-mine':''}" style="text-align:right;">
