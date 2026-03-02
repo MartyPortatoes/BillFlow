@@ -726,6 +726,7 @@ async function load() {
 // ═══════════════════════════════════════════════
 let _sseSource = null;
 let _pendingReload = false;
+let _reloading = false;
 
 function connectSSE() {
   if (_sseSource) _sseSource.close();
@@ -752,17 +753,31 @@ document.addEventListener('focusout', () => {
   }
 });
 
-document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible') {
-    _reloadFromServer();
-  }
-});
+// Note: visibilitychange intentionally omitted — it caused a feedback loop:
+// reload → saveMonthNow → broadcastChange → SSE data-changed → reload ...
+// SSE alone is sufficient for cross-device sync.
 
 async function _reloadFromServer() {
-  await load();
-  recalcAll();
-  renderBills();
-  renderSettings();
+  if (_reloading) return;
+  _reloading = true;
+  try {
+    await load();
+    // Recompute cached fields in memory WITHOUT writing back to the server.
+    // Calling saveMonthNow() here would trigger broadcastChange → SSE loop.
+    const k = monthKey();
+    if (!S.monthly[k]) S.monthly[k] = { totals:{}, amounts:{} };
+    S.monthly[k]._myTotal = computeMyTotal();
+    const owes = computePersonOwes();
+    S.monthly[k]._owes = {};
+    Object.entries(owes).forEach(([pid, d]) => { S.monthly[k]._owes[pid] = d.total; });
+    renderSummary();
+    renderSendPay();
+    updateTabBadge();
+    renderBills();
+    renderSettings();
+  } finally {
+    _reloading = false;
+  }
 }
 
 // ═══════════════════════════════════════════════
