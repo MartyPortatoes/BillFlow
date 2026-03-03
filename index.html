@@ -549,13 +549,6 @@ hr{border:none;border-top:1px solid var(--border);margin:16px 0;}
     </div>
   </div>
 
-  <div class="card">
-    <div class="setting-group">
-      <div class="setting-group-title">Bill Defaults</div>
-      <div id="billConfig"></div>
-    </div>
-  </div>
-
   <div class="action-row">
     <button class="btn btn-green" onclick="saveSettings()">Save Settings</button>
     <button class="btn btn-ghost" onclick="exportData()">Export Backup</button>
@@ -955,6 +948,33 @@ function renderBills() {
 }
 
 function renderBillBody(bill) {
+  const identityRow = `
+    <div style="display:grid;grid-template-columns:44px 1fr 50px;gap:8px;
+         align-items:center;padding:10px 16px;border-bottom:1px solid var(--border);">
+      <input type="text" value="${bill.icon}" maxlength="2"
+             oninput="(function(v){const b=S.bills.find(b=>b.id==='${bill.id}');if(!b)return;
+               b.icon=v;
+               document.querySelector('#bill-${bill.id} .bill-icon')?.replaceChildren(document.createTextNode(v));
+               save();})(this.value)"
+             style="text-align:center;font-size:18px;padding:4px;width:44px;height:34px;
+                    background:${bill.color}22;border:1px solid var(--border);border-radius:6px;color:var(--text);">
+      <input type="text" value="${bill.name}" placeholder="Bill name"
+             oninput="(function(v){const b=S.bills.find(b=>b.id==='${bill.id}');if(!b)return;
+               b.name=v;
+               const el=document.querySelector('#bill-${bill.id} .bill-name');if(el)el.textContent=v;
+               save();})(this.value)"
+             style="font-size:12px;font-family:var(--mono);padding:6px 8px;
+                    background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);">
+      <input type="color" value="${bill.color}"
+             oninput="(function(v){const b=S.bills.find(b=>b.id==='${bill.id}');if(!b)return;
+               b.color=v;
+               const iconEl=document.querySelector('#bill-${bill.id} .bill-icon');
+               if(iconEl){iconEl.style.background=v+'22';iconEl.style.color=v;}
+               save();})(this.value)"
+             style="width:50px;height:34px;border:none;background:transparent;cursor:pointer;padding:0;">
+    </div>
+  `;
+
   const splitTypeToggle = `
     <div class="split-config">
       <span class="split-label">Split type:</span>
@@ -1092,7 +1112,7 @@ function renderBillBody(bill) {
     </div>
   `;
 
-  return splitTypeToggle + bodyContent + preserveToggle;
+  return identityRow + splitTypeToggle + bodyContent + preserveToggle;
 }
 
 function toggleBill(id) {
@@ -1973,7 +1993,6 @@ function renderSettings() {
   loadEmailConfig();
   renderPeopleConfig();
   renderGreetingConfig();
-  renderBillConfig();
 }
 
 // ── Email config UI ───────────────────────────────────────────────────────────
@@ -2255,30 +2274,6 @@ function removePerson(idx) {
     if (!ok) return;
     S.people.splice(idx,1);
     renderPeopleConfig();
-  }, { okLabel:'Remove', danger:true });
-}
-
-function renderBillConfig() {
-  const el = document.getElementById('billConfig');
-  if (!el) return;
-  el.innerHTML = S.bills.map((bill,idx) => `
-    <div style="display:grid;grid-template-columns:36px 1fr 60px 36px;gap:8px;align-items:center;padding:8px 0;border-bottom:1px solid var(--border);">
-      <input type="text" value="${bill.icon}" oninput="S.bills[${idx}].icon=this.value" style="text-align:center;font-size:16px;width:36px;padding:4px;" maxlength="2">
-      <input type="text" value="${bill.name}" oninput="S.bills[${idx}].name=this.value" style="font-size:12px;">
-      <input type="color" value="${bill.color}" oninput="S.bills[${idx}].color=this.value" style="width:60px;height:32px;border:none;background:transparent;cursor:pointer;padding:0;">
-      <button class="btn btn-danger btn-xs" onclick="removeBillFromSettings(${idx})">✕</button>
-    </div>
-  `).join('') + '<div style="padding-top:8px;font-size:10px;color:var(--muted)">Tip: Edit bill lines and splits on the Bills tab.</div>';
-}
-
-function removeBillFromSettings(idx) {
-  showConfirm(`Remove "${S.bills[idx].name}"?`, async ok => {
-    if (!ok) return;
-    S.bills.splice(idx,1);
-    renderBillConfig();
-    _reloading = true;
-    clearTimeout(_saveTimer);
-    try { await _flushState(); } finally { _reloading = false; }
   }, { okLabel:'Remove', danger:true });
 }
 
