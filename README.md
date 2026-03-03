@@ -9,14 +9,12 @@ Runs as a **single Docker container** with a SQLite database. No cloud, no subsc
 ## Screenshots
 
 <p align="center">
-  <img src="screenshots/bills.png" width="30%" alt="Bills tab" />
-  &nbsp;&nbsp;
-  <img src="screenshots/bill-expanded.png" width="30%" alt="Expanded bill with split config" />
-  &nbsp;&nbsp;
-  <img src="screenshots/send-receive.png" width="30%" alt="Send & Receive tab" />
+  <img src="screenshots/bills.png" width="32%" alt="Bills tab" />
+  &nbsp;
+  <img src="screenshots/send-receive.png" width="32%" alt="Send & Receive tab" />
+  &nbsp;
+  <img src="screenshots/trends.png" width="32%" alt="Trends tab" />
 </p>
-
-*Screenshots from the [iOS companion app](https://github.com/martyportatoes/billhive-ios) — the web app shares the same features and data.*
 
 ---
 
