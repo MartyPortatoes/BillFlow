@@ -14,6 +14,23 @@
  * @param {number} opts.payAmount     — amount for deep link
  * @param {string} opts.fromName      — sender display name
  */
+function escapeHtml(str) {
+  if (str == null) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+function safeUrl(url) {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === 'https:' ? url : '';
+  } catch { return ''; }
+}
+
 function buildEmailHtml(opts) {
   const {
     greeting, personName, accentColor = '#F5A800',
@@ -28,9 +45,10 @@ function buildEmailHtml(opts) {
   let payButtonHtml = '';
   if (payMethod === 'zelle' && (payId || customZelleUrl)) {
     if (customZelleUrl) {
-      payButtonHtml = `
+      const safeZelleUrl = safeUrl(customZelleUrl);
+      payButtonHtml = safeZelleUrl ? `
       <tr><td align="center" style="padding:28px 0 8px;">
-        <a href="${customZelleUrl}"
+        <a href="${safeZelleUrl}"
            style="display:inline-block;background:${accentColor};color:#0c0d0f;text-decoration:none;
                   font-family:Arial,sans-serif;font-weight:700;font-size:15px;
                   padding:14px 36px;border-radius:8px;letter-spacing:.02em;">
@@ -39,9 +57,9 @@ function buildEmailHtml(opts) {
       </td></tr>
       <tr><td align="center" style="padding:0 0 8px;">
         <span style="font-size:11px;color:#6b7280;font-family:Arial,sans-serif;">
-          Zelle to ${payId}
+          Zelle to ${escapeHtml(payId)}
         </span>
-      </td></tr>`;
+      </td></tr>` : '';
     } else {
       payButtonHtml = `
       <tr><td align="center" style="padding:28px 0 8px;">
@@ -53,12 +71,12 @@ function buildEmailHtml(opts) {
       </td></tr>
       <tr><td align="center" style="padding:0 0 8px;">
         <span style="font-size:11px;color:#6b7280;font-family:Arial,sans-serif;">
-          Send to ${payId} on Zelle
+          Send to ${escapeHtml(payId)} on Zelle
         </span>
       </td></tr>`;
     }
   } else if (payMethod === 'venmo' && payId) {
-    const handle = payId.replace('@', '');
+    const handle = encodeURIComponent(payId.replace('@', ''));
     const note = encodeURIComponent(`Bills ${monthLabel}`);
     const venmoUrl = `https://venmo.com/${handle}?txn=charge&amount=${total.toFixed(2)}&note=${note}`;
     payButtonHtml = `
@@ -72,11 +90,11 @@ function buildEmailHtml(opts) {
       </td></tr>
       <tr><td align="center" style="padding:0 0 8px;">
         <span style="font-size:11px;color:#6b7280;font-family:Arial,sans-serif;">
-          Venmo @${handle}
+          Venmo @${escapeHtml(payId.replace('@', ''))}
         </span>
       </td></tr>`;
   } else if (payMethod === 'cashapp' && payId) {
-    const tag = payId.replace('$', '');
+    const tag = encodeURIComponent(payId.replace('$', ''));
     const cashAppUrl = `https://cash.app/$${tag}`;
     payButtonHtml = `
       <tr><td align="center" style="padding:28px 0 8px;">
@@ -89,7 +107,7 @@ function buildEmailHtml(opts) {
       </td></tr>
       <tr><td align="center" style="padding:0 0 8px;">
         <span style="font-size:11px;color:#6b7280;font-family:Arial,sans-serif;">
-          Cash App $${tag}
+          Cash App $${escapeHtml(payId.replace('$', ''))}
         </span>
       </td></tr>`;
   } else {
@@ -107,7 +125,7 @@ function buildEmailHtml(opts) {
   const billRowsHtml = bills.map(b => `
     <tr>
       <td style="padding:10px 16px;font-family:Arial,sans-serif;font-size:13px;
-                 color:#d1d5db;border-bottom:1px solid #2a2d31;">${b.name}</td>
+                 color:#d1d5db;border-bottom:1px solid #2a2d31;">${escapeHtml(b.name)}</td>
       <td style="padding:10px 16px;font-family:Arial,sans-serif;font-size:13px;
                  color:${accentColor};font-weight:600;text-align:right;
                  border-bottom:1px solid #2a2d31;">$${b.amount.toFixed(2)}</td>
@@ -155,10 +173,10 @@ function buildEmailHtml(opts) {
         <tr>
           <td colspan="2" style="padding:28px 28px 8px;">
             <div style="font-size:22px;font-weight:700;color:#f9fafb;font-family:Arial,sans-serif;">
-              ${greeting || ('Hi ' + personName + ',')}
+              ${escapeHtml(greeting) || ('Hi ' + escapeHtml(personName) + ',')}
             </div>
             <div style="font-size:14px;color:#9ca3af;margin-top:6px;font-family:Arial,sans-serif;">
-              Here's your share of the household bills for <strong style="color:#f9fafb;">${monthLabel}</strong>.
+              Here's your share of the household bills for <strong style="color:#f9fafb;">${escapeHtml(monthLabel)}</strong>.
             </div>
           </td>
         </tr>
@@ -208,7 +226,7 @@ function buildEmailHtml(opts) {
         <tr>
           <td colspan="2" style="padding:24px 28px;border-top:1px solid #2a2d31;">
             <div style="font-size:12px;color:#6b7280;font-family:Arial,sans-serif;">
-              Sent by ${fromName} via BillHive &nbsp;·&nbsp;
+              Sent by ${escapeHtml(fromName)} via BillHive &nbsp;·&nbsp;
               <span style="color:#4b5563;">Reply to this email if you have any questions.</span>
             </div>
           </td>
