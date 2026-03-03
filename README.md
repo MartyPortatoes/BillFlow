@@ -1,8 +1,12 @@
-# BillHive
+<p align="center">
+  <img src="screenshots/logo.png" width="100" alt="BillHive" />
+</p>
 
-Self-hosted household bill management. One person fronts every bill — BillHive tracks the splits, generates Zelle/Venmo/Cash App payment links, and sends HTML email summaries to everyone who owes money.
+<h1 align="center">BillHive</h1>
 
-Runs as a **single Docker container** with a SQLite database. No cloud, no subscription, no external services required.
+<p align="center">Self-hosted household bill management. One person fronts every bill — BillHive tracks the splits, generates Zelle/Venmo/Cash App payment links, and sends HTML email summaries to everyone who owes money.</p>
+
+<p align="center">Runs as a <strong>single Docker container</strong> with a SQLite database. No cloud, no subscription, no external services required.</p>
 
 ---
 
