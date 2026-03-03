@@ -1,40 +1,64 @@
-# BillHive 🏠
+# BillHive
 
-Household bill management app — per-bill splitting, Verizon line tracking,
-Zelle/Venmo deep links, trend charts, and server-side SQLite persistence.
+Self-hosted household bill management. One person fronts every bill — BillHive tracks the splits, generates Zelle/Venmo/Cash App payment links, and sends HTML email summaries to everyone who owes money.
 
-Single Docker image: Node.js serves both the frontend and the REST API.
+Runs as a **single Docker container** with a SQLite database. No cloud, no subscription, no external services required.
+
+---
+
+## Screenshots
+
+<p align="center">
+  <img src="screenshots/bills.png" width="30%" alt="Bills tab" />
+  &nbsp;&nbsp;
+  <img src="screenshots/bill-expanded.png" width="30%" alt="Expanded bill with split config" />
+  &nbsp;&nbsp;
+  <img src="screenshots/send-receive.png" width="30%" alt="Send & Receive tab" />
+</p>
+
+*Screenshots from the [iOS companion app](https://github.com/martyportatoes/billhive-ios) — the web app shares the same features and data.*
+
+---
+
+## Features
+
+**Bill splitting**
+- Split bills by **percentage** or **fixed dollar amounts** per line
+- Assign each line to a household member
+- "Covered by" relationships — Dad can pay on Mom's behalf while Mom shows $0 owed
+- Set a **remainder line** to absorb rounding on fixed-split bills
+- **Auto-carry forward** amounts month-to-month for bills that don't change
+
+**Payment collection**
+- **Zelle, Venmo, and Cash App** deep-links auto-generated with the exact amount pre-filled
+- Custom Zelle URLs supported for banks with their own enrollment flows
+- One-click **HTML email summaries** sent to each person with their itemized bill breakdown
+- Supports **Mailgun, SendGrid, Resend, and SMTP** — API keys stored server-side, never exposed to the browser
+
+**Tracking & history**
+- Summary tab shows each person's total owed with a full bill-by-bill breakdown
+- **Trend charts** — per-person and per-bill views with line charts, donut breakdowns, and stacked bar charts powered by Chart.js
+- **Monthly checklist** auto-generated from your people and bills — tracks what's been emailed, paid, and collected
+
+**Infrastructure**
+- Single Docker container — Node.js serves both the frontend and REST API
+- SQLite database in a named Docker volume — no external database required
+- **Multi-user safe** — deploy behind Authelia or Authentik; BillHive reads the `Remote-User` / `X-Authentik-Username` header and scopes all data per user
+- Full JSON **export/import** backup via the Settings tab
 
 ---
 
 ## Quick Start
 
 ```bash
-# Pull and run (once image is published)
-docker compose up -d
-
-# Or build locally from source
-docker compose up -d --build
+docker run -d \
+  --name billhive \
+  -p 8080:8080 \
+  -v billhive-data:/data \
+  ghcr.io/martyportatoes/billflow:latest
 ```
 
 Open **http://localhost:8080**
-
----
-
-## Project Structure
-
-```
-billhive/
-├── server.js          # Express — serves frontend + REST API
-├── package.json
-├── Dockerfile
-├── docker-compose.yml
-├── public/
-│   └── index.html     # Frontend (vanilla JS, no build step)
-└── .github/
-    └── workflows/
-        └── docker-publish.yml
-```
 
 ---
 
@@ -43,7 +67,7 @@ billhive/
 ```yaml
 services:
   billhive:
-    image: ghcr.io/martyportatoes/billhive:latest
+    image: ghcr.io/martyportatoes/billflow:latest
     container_name: billhive
     restart: unless-stopped
     ports:
@@ -59,23 +83,18 @@ volumes:
 
 ## Reverse Proxy Setup
 
-Point your proxy at port `8080` (or whatever `BILLHIVE_PORT` is set to).
+Point your proxy at port `8080`. BillHive reads the following headers for user identity (first match wins):
 
-### Authelia
-Automatically injects `Remote-User` header — no BillHive config needed.
+| Header | Set by |
+|---|---|
+| `Remote-User` | Authelia |
+| `X-Authentik-Username` | Authentik |
+| `X-Forwarded-User` | Generic proxies |
+| `X-Remote-User` | Generic proxies |
 
-```yaml
-# Authelia access_control example
-rules:
-  - domain: bills.yourdomain.com
-    policy: one_factor
-```
+Without a proxy, all data is stored under user ID `local` (single-user mode).
 
-### Authentik
-Automatically injects `X-Authentik-Username` — ensure "Pass User Headers" is
-enabled in your proxy provider (it is by default).
-
-### Traefik labels (add to the billhive service)
+### Traefik labels
 
 ```yaml
 labels:
@@ -86,8 +105,6 @@ labels:
   - "traefik.http.routers.billhive.middlewares=authelia@docker"
   - "traefik.http.services.billhive.loadbalancer.server.port=8080"
 ```
-
-Without a proxy, all data is stored under the user ID `local` (single-user mode).
 
 ---
 
@@ -133,11 +150,17 @@ docker exec billhive sqlite3 /data/billhive.db .dump > backup.sql
 | GET | `/api/health` | Health check + current user |
 | GET | `/api/state` | Load config (settings, people, bills) |
 | PUT | `/api/state` | Save config |
+| PATCH | `/api/state/:key` | Save a single config key |
 | GET | `/api/months` | All monthly data |
 | GET | `/api/months/:key` | Single month (`YYYY-MM`) |
-| PUT | `/api/months/:key` | Save month |
-| GET | `/api/export` | Download JSON backup |
+| PUT | `/api/months/:key` | Save month data |
+| DELETE | `/api/months/:key` | Delete a month |
+| GET | `/api/export` | Download full JSON backup |
 | POST | `/api/import` | Restore from JSON backup |
+| GET | `/api/email/config` | Get email config (secrets masked) |
+| PUT | `/api/email/config` | Save email config |
+| POST | `/api/email/test` | Send a test email |
+| POST | `/api/email/send` | Send bill summary to a person |
 
 ---
 
@@ -148,3 +171,9 @@ docker compose pull && docker compose up -d
 ```
 
 Data in the volume is preserved across updates.
+
+---
+
+## iOS Companion App
+
+A native iOS app is available at [github.com/martyportatoes/billhive-ios](https://github.com/martyportatoes/billhive-ios). It connects directly to your self-hosted BillHive server — same data, same splits, same email summaries from your iPhone.
