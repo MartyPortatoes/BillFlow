@@ -567,11 +567,45 @@ hr{border:none;border-top:1px solid var(--border);margin:16px 0;}
         integrity="sha512-SIMGYRUjwY8+gKg7nn9EItdD8LCADSDfJNutF9TPrvEo86sQmFMh6MyralfIyhADlajSxqc7G0gs7+MwWF/ogQ=="
         crossorigin="anonymous"></script>
 <script>
+// ═══════════════════════════════════════════════════════════════════════════════
+// BillHive — Frontend Application
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Single-page vanilla JS app. No build step, no framework, no bundler.
+//
+// Key concepts:
+//   S (global state)  — Single source of truth for settings, people, bills,
+//                        monthly data, and checklist state.
+//   save()            — Debounced (600ms) PUT /api/state. Batches keystrokes.
+//   saveMonthNow()    — Immediate PUT /api/months/:key for numeric data.
+//   recalcAll()       — Recomputes summary, send/receive, and checklist after
+//                        any data change.
+//   SSE               — Real-time multi-device sync via Server-Sent Events.
+//
+// The primary person always has id:'me' — enforced by normalizeState().
+// ═══════════════════════════════════════════════════════════════════════════════
+
 // ═══════════════════════════════════════════════
 //  STATE
 // ═══════════════════════════════════════════════
+
+// Rotating palette for assigning colors to new people
 const PERSON_COLORS = ['#F5A800','#5bc4f5','#f5a623','#f06292','#b39ddb','#80cbc4','#ffcc80'];
 
+// Escape user-supplied strings before inserting into innerHTML to prevent XSS
+function esc(str) {
+  if (str == null) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+// Global state object — the single source of truth. Loaded from the API on init,
+// mutated by UI interactions, and persisted back via debounced save().
+// These defaults are used only on first launch before any server data exists.
 let S = {
   settings: { myEmail: '' },
   people: [
@@ -627,26 +661,32 @@ let S = {
   checklist: {}, // key: "YYYY-MM" → { itemId: bool }
 };
 
+// Chart.js instances — kept in module scope so they can be destroyed before
+// re-creation on tab switch (prevents canvas memory leaks).
 let trendChartInst = null, pieChartInst = null;
 let billTrendChartInst = null, billBarChartInst = null;
-let trendsView = 'person';
-let trendsMonthLimit = 12;
+let trendsView = 'person';    // 'person' or 'bill' — controls which trends tab is visible
+let trendsMonthLimit = 12;    // 0 = all, 12 = last 12 months, 24 = last 24 months
 
 // ═══════════════════════════════════════════════
 //  API PERSISTENCE
 // ═══════════════════════════════════════════════
 const API = '/api';
-let _saveTimer = null;
-let _currentUser = 'local';
+let _saveTimer = null;   // setTimeout handle for the debounced save
+let _currentUser = 'local';  // Display name from /api/health — shown in header
 
-// Debounced save — batches rapid keystrokes into one API call
+// Debounced save — batches rapid keystrokes into one API call.
+// The 600ms delay is intentional: it prevents hammering the API on every
+// keystroke while still feeling responsive. Don't reduce it.
 function save() {
   clearTimeout(_saveTimer);
   _saveTimer = setTimeout(() => _flushState(), 600);
 }
 
 async function _flushState() {
-  _saveTimer = null; // Clear so SSE reload can proceed after this save completes
+  // Clear the timer reference so _reloadFromServer() knows there are no
+  // pending local changes and it's safe to reload from the server.
+  _saveTimer = null;
   try {
     await fetch(`${API}/state`, {
       method: 'PUT',
@@ -661,6 +701,9 @@ async function _flushState() {
   } catch(e) { console.warn('State save failed:', e); }
 }
 
+// Immediate (non-debounced) save for monthly numeric data. Unlike save(), this
+// fires right away because month totals must persist before a tab switch or
+// page unload. Called by saveMonthSnapshot() after computing derived values.
 async function saveMonthNow(key, data) {
   try {
     await fetch(`${API}/months/${key}`, {
@@ -726,6 +769,18 @@ async function load() {
 // ═══════════════════════════════════════════════
 //  REAL-TIME SYNC (SSE + Page Visibility)
 // ═══════════════════════════════════════════════
+// How multi-device sync works:
+//   1. Each tab opens an EventSource to /api/events
+//   2. On any write, the server broadcasts `data-changed` to all of the user's tabs
+//   3. The receiving tab reloads state from the API and re-renders
+//
+// Guard flags:
+//   _pendingReload — set when SSE fires while the user is typing; deferred to focusout
+//   _reloading     — prevents re-entrant reloads AND prevents saveMonthSnapshot()
+//                     from writing back during a reload (which would cause an infinite
+//                     loop: reload → save → broadcast → reload → ...)
+//   _saveTimer     — if non-null, local changes are pending; skip reload to avoid
+//                     overwriting the user's unsaved edits with stale server state
 let _sseSource = null;
 let _pendingReload = false;
 let _reloading = false;
@@ -798,6 +853,8 @@ function monthLabelLong(key) {
 // ═══════════════════════════════════════════════
 //  DATA HELPERS
 // ═══════════════════════════════════════════════
+// Monthly data accessors — all scoped to the currently selected month/year.
+// getMonthData() lazily initializes the month entry if it doesn't exist yet.
 function getMonthData() {
   const k = monthKey();
   if (!S.monthly[k]) S.monthly[k] = { totals:{}, amounts:{} };
@@ -812,9 +869,21 @@ function setLineAmount(billId, lineId, val) {
 }
 function setBillTotal(billId, val) { getMonthData().totals[billId] = val; }
 
+// Safe person lookup — returns a fallback object if the person was deleted
+// or if a stale reference exists from an old import.
 function getPerson(id) { return S.people.find(p=>p.id===id) || {id:id, name:id, color:'#767880'}; }
 
-// Compute what each person owes/pays for a bill
+// Compute what each person owes/pays for a bill.
+//
+// Two split modes:
+//   'pct'   — Each line has a percentage (0-100). Amount = total × (pct/100).
+//   'fixed' — Each line has a dollar amount except the "remainder" line, which
+//             absorbs total - sum(other lines). This is useful for bills where
+//             you know each person's exact charge (e.g. phone plan line items).
+//
+// coveredById: When set, the debt for that line shifts from personId to
+// coveredById. Example: Mom's phone line is "covered by" Dad, so Dad pays
+// for it instead of Mom. Used for family plan scenarios.
 function computeBillSplit(bill) {
   const total = getBillTotal(bill.id);
   const result = {}; // personId → amount
@@ -920,15 +989,15 @@ function renderBills() {
       const p = getPerson(pid);
       const isCoverer = payers.includes(pid) && !participants.includes(pid);
       const c = p.color || '#767880';
-      return `<span class="pill" style="background:${c}26;color:${c};border-color:${c}40">${isCoverer ? '↑ ' : ''}${p.name}</span>`;
+      return `<span class="pill" style="background:${c}26;color:${c};border-color:${c}40">${isCoverer ? '↑ ' : ''}${esc(p.name)}</span>`;
     }).join(' ');
 
     card.innerHTML = `
       <div class="bill-header" onclick="toggleBill('${bill.id}')">
         <div class="bill-name-wrap">
-          <div class="bill-icon" style="background:${bill.color}22;color:${bill.color}">${bill.icon}</div>
+          <div class="bill-icon" style="background:${bill.color}22;color:${bill.color}">${esc(bill.icon)}</div>
           <div>
-            <div class="bill-name">${bill.name}</div>
+            <div class="bill-name">${esc(bill.name)}</div>
             <div class="bill-sub">${pillsHtml} &nbsp;<span style="color:var(--muted2);font-size:10px">${bill.splitType==='pct'?'% split':'fixed split'}</span></div>
           </div>
         </div>
@@ -1286,14 +1355,18 @@ function removeBill(billId) {
 function addNewBill() {
   showPrompt('New bill name?', 'e.g. Water, Netflix…', name => {
     if (!name) return;
+    const secondPerson = S.people.find(p => p.id !== 'me') || S.people[0];
+    const lines = [
+      {id:'l1', desc:name, personId:'me', value: secondPerson && secondPerson.id !== 'me' ? 50 : 100},
+    ];
+    if (secondPerson && secondPerson.id !== 'me') {
+      lines.push({id:'l2', desc:name, personId:secondPerson.id, value:50});
+    }
     S.bills.push({
       id: 'bill_'+Date.now(),
       name, icon:'💵', color:'#F5A800',
       splitType:'pct', remainderLineId:'l1',
-      lines:[
-        {id:'l1', desc:name, personId:'me',   value:50},
-        {id:'l2', desc:name, personId:'wife', value:50},
-      ]
+      lines
     });
     renderBills();
     // Expand new bill
@@ -1328,6 +1401,9 @@ function refreshBillBody(billId) {
 // ═══════════════════════════════════════════════
 //  RECALC ALL (summary + sendpay)
 // ═══════════════════════════════════════════════
+// Called after every data mutation. Recomputes all derived displays (summary
+// cards, send/receive section, checklist, tab badge) and persists the month
+// snapshot for trend charts.
 function recalcAll() {
   saveMonthSnapshot();
   renderSummary();
@@ -1335,6 +1411,10 @@ function recalcAll() {
   updateTabBadge();
 }
 
+// Persist computed totals (_myTotal, _owes) into the monthly data so that
+// trend charts can display historical values even when bill config changes.
+// CRITICAL: Checks `_reloading` guard — must NOT write during a server reload
+// or it would trigger broadcastChange → SSE → reload → infinite loop.
 function saveMonthSnapshot() {
   const k = monthKey();
   if (!S.monthly[k]) S.monthly[k] = { totals:{}, amounts:{} };
@@ -1385,7 +1465,7 @@ function renderSummary() {
     card.className = `person-summary-card ${colorClass}`;
     card.style.setProperty('--pc', person.color);
     card.innerHTML = `
-      <div class="ps-name" style="color:${person.color}">${person.name}</div>
+      <div class="ps-name" style="color:${person.color}">${esc(person.name)}</div>
       <div class="ps-amount">$${d.total.toFixed(2)}</div>
       <div class="ps-bills">${billList || 'No bills assigned'}</div>
     `;
@@ -1403,7 +1483,7 @@ function renderSummary() {
       const split = computeBillSplit(bill);
       const mine = split['me'] || 0;
       if (mine > 0) {
-        html += `<div class="sum-row"><span class="sum-label">${bill.icon} ${bill.name}</span><span class="sum-val" style="font-size:14px;">$${mine.toFixed(2)}</span></div>`;
+        html += `<div class="sum-row"><span class="sum-label">${esc(bill.icon)} ${esc(bill.name)}</span><span class="sum-val" style="font-size:14px;">$${mine.toFixed(2)}</span></div>`;
       }
     });
     myOutlay.innerHTML = html || `<div style="color:var(--muted);font-size:12px;padding:12px 0">No amounts entered yet.</div>`;
@@ -1420,12 +1500,12 @@ function renderSummary() {
       const billTotal = getBillTotal(bill.id);
       if (billTotal === 0) return;
       html += `<div style="margin-bottom:16px;">
-        <div style="font-family:'DM Mono',monospace;font-weight:700;font-size:13px;margin-bottom:6px;color:${bill.color}">${bill.icon} ${bill.name} — $${billTotal.toFixed(2)} total</div>`;
+        <div style="font-family:'DM Mono',monospace;font-weight:700;font-size:13px;margin-bottom:6px;color:${bill.color}">${esc(bill.icon)} ${esc(bill.name)} — $${billTotal.toFixed(2)} total</div>`;
       S.people.forEach(p => {
         const amt = split[p.id] || 0;
         if (!amt) return;
         html += `<div class="sum-row" style="padding:6px 0 6px 12px;">
-          <span class="sum-label" style="color:${p.color}">${p.name}</span>
+          <span class="sum-label" style="color:${p.color}">${esc(p.name)}</span>
           <span style="font-size:13px;color:${p.color}">$${amt.toFixed(2)}</span>
         </div>`;
       });
@@ -1483,7 +1563,7 @@ function renderReceiveCards() {
 
     const greetingLine = person.greeting || ('Hi ' + person.name + ',');
     const billRows = d.bills.map(b =>
-      `<div class="receive-bill-row"><span style="color:var(--muted)">${b.name}</span><span style="color:var(--text)">$${b.amount.toFixed(2)}</span></div>`
+      `<div class="receive-bill-row"><span style="color:var(--muted)">${esc(b.name)}</span><span style="color:var(--text)">$${b.amount.toFixed(2)}</span></div>`
     ).join('');
 
     return `
@@ -1492,7 +1572,7 @@ function renderReceiveCards() {
           <div class="receive-person">
             <div class="receive-person-dot" style="background:${person.color}"></div>
             <div>
-              <div class="receive-person-name" style="color:${person.color}">${person.name}</div>
+              <div class="receive-person-name" style="color:${person.color}">${esc(person.name)}</div>
               <div class="receive-person-method">${payDesc}</div>
             </div>
           </div>
@@ -1671,16 +1751,18 @@ function renderSendCards() {
     const url = bill.payUrl || '';
     const hasUrl = url.length > 0;
 
-    const payBtn = hasUrl
-      ? `<a class="btn btn-green btn-sm" href="${url}" target="_blank" onclick="markCheck('pay_${bill.id}')">Pay ↗</a>`
-      : `<span style="font-size:10px;color:var(--muted2)">Add URL to get Pay button</span>`;
+    // Only allow http(s) URLs — block javascript: and other dangerous protocols
+    const safePayUrl = hasUrl && /^https?:\/\//i.test(url) ? esc(url) : '';
+    const payBtn = safePayUrl
+      ? `<a class="btn btn-green btn-sm" href="${safePayUrl}" target="_blank" rel="noopener" onclick="markCheck('pay_${bill.id}')">Pay ↗</a>`
+      : `<span style="font-size:10px;color:var(--muted2)">${hasUrl ? 'Invalid URL (must start with http)' : 'Add URL to get Pay button'}</span>`;
 
     return `
       <div class="send-card">
         <div class="send-card-left">
-          <div class="send-bill-icon" style="background:${bill.color}22;color:${bill.color}">${bill.icon}</div>
+          <div class="send-bill-icon" style="background:${bill.color}22;color:${bill.color}">${esc(bill.icon)}</div>
           <div>
-            <div class="send-bill-name">${bill.name}</div>
+            <div class="send-bill-name">${esc(bill.name)}</div>
             <div class="send-bill-amount">${billTotal > 0 ? 'My share: $' + myAmt.toFixed(2) + ' of $' + billTotal.toFixed(2) : 'No amount entered'}</div>
           </div>
         </div>
@@ -1710,14 +1792,21 @@ function updateBillPayUrl(billId, url) {
     // Replace everything after the input
     const existingBtn = right.querySelector('a.btn, span');
     if (existingBtn) existingBtn.remove();
-    if (hasUrl) {
+    const isSafe = hasUrl && /^https?:\/\//i.test(bill.payUrl);
+    if (isSafe) {
       const a = document.createElement('a');
       a.className = 'btn btn-green btn-sm';
       a.href = bill.payUrl;
       a.target = '_blank';
+      a.rel = 'noopener';
       a.textContent = 'Pay ↗';
       a.onclick = () => markCheck('pay_' + billId);
       right.appendChild(a);
+    } else if (hasUrl) {
+      const span = document.createElement('span');
+      span.style.cssText = 'font-size:10px;color:var(--red)';
+      span.textContent = 'Invalid URL (must start with http)';
+      right.appendChild(span);
     } else {
       const span = document.createElement('span');
       span.style.cssText = 'font-size:10px;color:var(--muted2)';
@@ -1974,7 +2063,7 @@ function renderTrendsBillView() {
       return `<div class="sum-row" style="padding:8px 0;">
         <div style="display:flex;align-items:center;gap:8px;">
           <div style="width:8px;height:8px;border-radius:50%;background:${bill.color};flex-shrink:0;"></div>
-          <div style="font-size:12px;">${bill.name}</div>
+          <div style="font-size:12px;">${esc(bill.name)}</div>
         </div>
         <div style="font-family:'DM Mono',monospace;font-weight:700;color:${bill.color};">$${total.toFixed(2)}</div>
       </div>`;
@@ -2205,7 +2294,7 @@ function renderPeopleConfig() {
       <div class="person-card" id="person-card-${p.id}">
         <div class="person-header" onclick="togglePerson('${p.id}')">
           <span style="width:12px;height:12px;border-radius:50%;background:${p.color};display:inline-block;flex-shrink:0;"></span>
-          <span class="person-header-name">${p.name||'New Person'}</span>
+          <span class="person-header-name">${esc(p.name||'New Person')}</span>
           ${isMe
             ? `<span style="margin-left:auto;font-size:9px;font-weight:500;letter-spacing:.1em;text-transform:uppercase;color:var(--muted2);background:var(--surface3);padding:3px 7px;border-radius:4px;">you</span>`
             : `<span class="person-header-meta">${payLabel}</span>`}
@@ -2241,7 +2330,7 @@ function renderPeopleConfig() {
           </div>
           ${!isMe ? `
           <div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border);">
-            <button class="btn btn-danger btn-sm" style="width:100%;" onclick="removePerson(${idx})">✕ Remove ${p.name||'Person'}</button>
+            <button class="btn btn-danger btn-sm" style="width:100%;" onclick="removePerson(${idx})">✕ Remove ${esc(p.name||'Person')}</button>
           </div>` : ''}
         </div>
       </div>`;
@@ -2261,19 +2350,41 @@ function cyclePeopleColor(idx) {
 }
 
 function addPerson() {
-  const newPerson = { id:'p'+Date.now(), name:'New Person', color:PERSON_COLORS[S.people.length%PERSON_COLORS.length], payMethod:'manual', payId:'', email:'' };
+  const newPerson = { id:'p'+Date.now(), name:'New Person', color:PERSON_COLORS[S.people.length%PERSON_COLORS.length], payMethod:'manual', payId:'', email:'', greeting:'' };
   S.people.push(newPerson);
   renderPeopleConfig();
   // Auto-expand the new card
   const card = document.getElementById(`person-card-${newPerson.id}`);
   if (card) card.classList.add('expanded');
+  save();
 }
 
 function removePerson(idx) {
   showConfirm(`Remove ${S.people[idx].name}?`, ok => {
     if (!ok) return;
+    const removedId = S.people[idx].id;
     S.people.splice(idx,1);
+    // Clean up bill line references pointing to the removed person
+    S.bills.forEach(bill => {
+      // Remove lines assigned to this person (unless they're the only line)
+      bill.lines = bill.lines.filter(l => {
+        if (l.personId === removedId && bill.lines.length > 1) return false;
+        return true;
+      });
+      // Reassign any remaining lines that reference the removed person
+      bill.lines.forEach(l => {
+        if (l.personId === removedId) l.personId = 'me';
+        if (l.coveredById === removedId) l.coveredById = null;
+      });
+      // Fix remainderLineId if it pointed to a removed line
+      if (bill.remainderLineId && !bill.lines.find(l => l.id === bill.remainderLineId)) {
+        bill.remainderLineId = bill.lines[0]?.id || '';
+      }
+    });
     renderPeopleConfig();
+    renderBills();
+    recalcAll();
+    save();
   }, { okLabel:'Remove', danger:true });
 }
 
@@ -2309,6 +2420,9 @@ Object.assign(S.settings, { mortgageUrl:'', mortgageProvider:'' });
 // ═══════════════════════════════════════════════
 //  NAVIGATION
 // ═══════════════════════════════════════════════
+// Tab switching — each tab re-renders its content fresh on activation.
+// This avoids stale data and ensures chart instances are properly
+// destroyed/recreated (Chart.js requires this to avoid canvas leaks).
 document.querySelectorAll('.tab').forEach(tab => {
   tab.addEventListener('click', () => {
     document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
@@ -2332,6 +2446,9 @@ function onMonthChange() {
   recalcAll();
 }
 
+// When switching to a new month, bills with "Carry amounts forward" enabled
+// will automatically copy their totals and line amounts from the previous month
+// — but only if the current month has no data for that bill yet (won't overwrite).
 function autoFillPreservedBills() {
   const key = monthKey();
   const [y, m] = key.split('-').map(Number);
@@ -2376,6 +2493,13 @@ function toast(msg) {
 // ═══════════════════════════════════════════════
 //  INIT
 // ═══════════════════════════════════════════════
+// Boot sequence:
+//   1. Set month/year selectors to the current date
+//   2. Load state + monthly data from the API (or use defaults if offline)
+//   3. normalizeState() ensures the 'me' person exists and fixes stale refs
+//   4. Render the Bills page (the default landing tab)
+//   5. recalcAll() computes summary, send/receive, and persists the month snapshot
+//   6. Open SSE connection for real-time sync with other tabs/devices
 async function init() {
   const now = new Date();
   document.getElementById('monthSel').value = now.getMonth();
@@ -2410,6 +2534,10 @@ function hideBanner() {
 // ═══════════════════════════════════════════════
 //  MODAL (replaces native prompt / confirm)
 // ═══════════════════════════════════════════════
+// Custom modal dialog that replaces browser-native prompt() and confirm()
+// for a consistent dark-theme look. Uses a single #modal-overlay element
+// shared between both modes. The callback receives the input value (prompt)
+// or true/false (confirm).
 let _modalCb = null, _modalMode = 'confirm';
 
 function showPrompt(title, placeholder, cb) {

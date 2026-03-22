@@ -1,6 +1,30 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// server.js — BillHive Express API Server
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// This is the main backend for BillHive, a self-hosted household bill-splitting
+// app. It provides a REST API for managing bill state, monthly numeric data, and
+// email configuration, plus a Server-Sent Events (SSE) endpoint for real-time
+// multi-device sync.
+//
+// Architecture overview:
+//   - Express 4.x with better-sqlite3 (synchronous — no async for DB ops)
+//   - Multi-user via reverse-proxy auth headers (Authelia, Authentik, etc.)
+//   - Falls back to user "local" when no proxy header is present
+//   - SSE broadcasts a `data-changed` event to all of a user's open tabs on write
+//   - Email relay supports SMTP, Mailgun, SendGrid, and Resend via nodemailer
+//   - Runs in Docker on node:20-alpine; data stored at /data/billhive.db
+//
+// Data model:
+//   user_state   — key/value JSON blobs per user (settings, people, bills, checklist)
+//   monthly_data — per-month numeric snapshots keyed "YYYY-MM" per user
+//   email_config — provider credentials per user (secrets stored server-side only)
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
 const express = require('express');
 const rateLimit = require('express-rate-limit');
-const Database = require('better-sqlite3');
+const Database = require('better-sqlite3');   // Sync SQLite — never use async/await for DB calls
 const path = require('path');
 const fs = require('fs');
 const { sendEmail, maskConfig } = require('./email.js');
@@ -8,17 +32,34 @@ const { buildEmailHtml } = require('./emailTemplate.js');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
-const DB_PATH = process.env.DB_PATH || '/data/billhive.db';
+const DB_PATH = process.env.DB_PATH || '/data/billhive.db';  // Docker volume mount point
 
 // ── Ensure data directory exists ──────────────────────────────────────────────
 const dataDir = path.dirname(DB_PATH);
 if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
 
 // ── Database setup ────────────────────────────────────────────────────────────
+// WAL mode allows concurrent reads while a write is in progress, which improves
+// performance when multiple SSE clients are polling alongside state saves.
+// Foreign keys are enabled for future schema extensions but not currently used.
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 
+// Schema: three tables, all keyed by user_id for multi-tenant isolation.
+//
+// user_state:   Generic key/value store for app config blobs.
+//               Keys include: "settings", "people", "bills", "checklist".
+//               Each value is a JSON string. The frontend sends all four keys
+//               in a single PUT /api/state on every debounced save.
+//
+// email_config: Stores email provider credentials (SMTP, Mailgun, etc.) per user.
+//               Secrets are stored in plaintext server-side but NEVER returned to
+//               the browser — GET /api/email/config returns a masked copy.
+//
+// monthly_data: Per-month numeric snapshots keyed "YYYY-MM". Stores bill totals,
+//               per-line amounts, computed owes, etc. Used for trend charts and
+//               the history log. Written by the frontend via PUT /api/months/:key.
 db.exec(`
   CREATE TABLE IF NOT EXISTS user_state (
     user_id    TEXT    NOT NULL,
@@ -43,7 +84,8 @@ db.exec(`
   );
 `);
 
-// Prepared statements
+// Prepared statements — better-sqlite3 compiles these once at startup for
+// significantly faster repeated execution. All are synchronous (.get / .run / .all).
 const stmts = {
   getState:     db.prepare('SELECT value FROM user_state WHERE user_id = ? AND key = ?'),
   setState:     db.prepare('INSERT OR REPLACE INTO user_state (user_id, key, value, updated_at) VALUES (?, ?, ?, unixepoch())'),
@@ -57,7 +99,14 @@ const stmts = {
 };
 
 // ── SSE client tracking ───────────────────────────────────────────────────────
-const sseClients = new Map(); // userId -> Set of res objects
+// Maps each userId to a Set of open SSE response objects. When any write endpoint
+// (state, months, import) completes, broadcastChange() pushes a lightweight
+// `data-changed` event to every open tab for that user. The frontend then
+// reloads state from the API — keeping multiple devices/tabs in sync.
+//
+// Cleanup: when a client disconnects, its res is removed from the Set. If the
+// Set is empty, the Map entry is deleted to prevent memory buildup over time.
+const sseClients = new Map();
 
 function broadcastChange(userId) {
   const clients = sseClients.get(userId);
@@ -72,10 +121,15 @@ const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 300 });
 app.use(limiter);
 
 // ── Middleware ────────────────────────────────────────────────────────────────
+// 2 MB limit is generous enough for large bill configs + monthly data imports
+// while protecting against accidental mega-payloads.
 app.use(express.json({ limit: '2mb' }));
 
-// Auth — reads user identity injected by reverse proxy (Authelia / Authentik).
-// Falls back to "local" for single-user mode with no proxy.
+// Auth middleware — identifies the current user from reverse-proxy headers.
+// Supported proxies: Authelia (Remote-User), Authentik (X-Authentik-Username),
+// and generic forward-auth setups (X-Forwarded-User, X-Remote-User).
+// When no proxy is present (e.g. local Docker Compose), defaults to "local"
+// so the app works seamlessly in single-user mode.
 app.use((req, res, next) => {
   req.userId =
     req.headers['remote-user']          ||   // Authelia
@@ -107,6 +161,13 @@ app.get('/api/health', (req, res) => {
 });
 
 // ── State API ─────────────────────────────────────────────────────────────────
+// GET  /api/state       — returns all key/value pairs for the current user
+// PUT  /api/state       — bulk upsert of multiple keys (used by the frontend's
+//                         debounced save — sends settings, people, bills, checklist)
+// PATCH /api/state/:key — upsert a single key (used for targeted updates)
+//
+// The frontend's save flow: user input → mutate S → debounced save() (600ms) →
+// PUT /api/state → server broadcasts SSE → other tabs reload.
 app.get('/api/state', (req, res) => {
   const rows = stmts.getAllState.all(req.userId);
   const state = {};
@@ -117,6 +178,9 @@ app.get('/api/state', (req, res) => {
 app.put('/api/state', (req, res) => {
   const body = req.body;
   if (!body || typeof body !== 'object') return res.status(400).json({ error: 'Invalid body' });
+
+  // Wrap in a transaction so all keys are written atomically — prevents
+  // partial state if the server crashes mid-write.
   const saveMany = db.transaction((userId, data) => {
     for (const [key, val] of Object.entries(data)) {
       stmts.setState.run(userId, key, JSON.stringify(val));
@@ -124,6 +188,8 @@ app.put('/api/state', (req, res) => {
   });
   saveMany(req.userId, body);
   res.json({ ok: true });
+
+  // Notify other tabs/devices AFTER responding — keeps the save latency low.
   broadcastChange(req.userId);
 });
 
@@ -134,6 +200,10 @@ app.patch('/api/state/:key', (req, res) => {
 });
 
 // ── Monthly data API ──────────────────────────────────────────────────────────
+// GET  /api/months       — all months for trend charts and history log
+// GET  /api/months/:key  — single month (YYYY-MM format)
+// PUT  /api/months/:key  — upsert a month's data (totals, amounts, computed owes)
+// DELETE /api/months/:key — remove a month's data entirely
 app.get('/api/months', (req, res) => {
   const rows = stmts.getAllMonths.all(req.userId);
   const months = {};
@@ -149,6 +219,7 @@ app.get('/api/months/:key', (req, res) => {
 
 app.put('/api/months/:key', (req, res) => {
   const key = req.params.key;
+  // Validate format to prevent arbitrary keys from polluting the table
   if (!/^\d{4}-\d{2}$/.test(key)) return res.status(400).json({ error: 'Invalid month key (expected YYYY-MM)' });
   stmts.setMonth.run(req.userId, key, JSON.stringify(req.body));
   res.json({ ok: true });
@@ -162,6 +233,11 @@ app.delete('/api/months/:key', (req, res) => {
 });
 
 // ── Export / Import ───────────────────────────────────────────────────────────
+// GET  /api/export — download a full JSON backup of all state + monthly data.
+//                    Scoped to the current user — won't leak other users' data.
+// POST /api/import — restore from a backup file. Merges into existing data
+//                    (upsert semantics) so it won't delete months/keys that
+//                    aren't in the backup.
 app.get('/api/export', (req, res) => {
   const state = {};
   stmts.getAllState.all(req.userId).forEach(r => { try { state[r.key] = JSON.parse(r.value); } catch {} });
@@ -194,22 +270,28 @@ app.get('/api/email/config', (req, res) => {
   } catch { res.json(null); }
 });
 
-// PUT /api/email/config — save full config including secrets
+// PUT /api/email/config — save full config including secrets.
+// Because the GET endpoint returns masked secrets (e.g. "SG.••••••••"), the
+// frontend might send those masked values back unchanged. To avoid overwriting
+// the real secret with dots, we detect masked values and keep the original.
 app.put('/api/email/config', (req, res) => {
   const body = req.body;
   if (!body || !body.provider) return res.status(400).json({ error: 'provider required' });
-  // Merge with existing to allow partial updates (so masked fields aren't overwritten with masked values)
+
+  // Load existing config for merge — allows partial updates without losing fields
   let existing = {};
   const row = stmts.getEmailCfg.get(req.userId);
   if (row) { try { existing = JSON.parse(row.config); } catch {} }
-  // Only update secret fields if they don't look like masked values
+
+  // Merge new values on top of existing, then fix up any masked secrets
   const secretFields = ['mailgunApiKey','sendgridApiKey','resendApiKey','smtpPass'];
   const merged = { ...existing, ...body };
   secretFields.forEach(f => {
     if (body[f] && body[f].includes('••••')) {
-      merged[f] = existing[f]; // keep original if user didn't change it
+      merged[f] = existing[f]; // keep original — user didn't change this field
     }
   });
+
   stmts.setEmailCfg.run(req.userId, JSON.stringify(merged));
   res.json({ ok: true });
 });
@@ -265,6 +347,14 @@ app.post('/api/email/send', async (req, res) => {
 });
 
 // ── SSE event stream ─────────────────────────────────────────────────────────
+// The frontend opens a persistent EventSource connection to this endpoint.
+// When any write occurs (state save, month update, import), broadcastChange()
+// pushes a `data-changed` event. The client-side handler then reloads from
+// the API — but only if no input is currently focused (to avoid disrupting typing).
+//
+// EventSource auto-reconnects on network errors, so no manual retry logic is
+// needed server-side. The `connected` event is sent immediately so the client
+// knows the connection is live.
 app.get('/api/events', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -272,15 +362,25 @@ app.get('/api/events', (req, res) => {
   res.flushHeaders();
   res.write('event: connected\ndata: {}\n\n');
 
+  // Register this response object for future broadcasts
   if (!sseClients.has(req.userId)) sseClients.set(req.userId, new Set());
   sseClients.get(req.userId).add(res);
 
+  // Clean up on disconnect — remove from Set, and delete the Map entry if
+  // this was the last client for this user (prevents memory leak).
   req.on('close', () => {
-    sseClients.get(req.userId)?.delete(res);
+    const clients = sseClients.get(req.userId);
+    if (clients) {
+      clients.delete(res);
+      if (clients.size === 0) sseClients.delete(req.userId);
+    }
   });
 });
 
 // ── SPA fallback — serve index.html for any non-API route ────────────────────
+// BillHive is a single-page app — all client-side routing happens in the browser.
+// Any path that isn't an /api/* route or a static file gets index.html so that
+// deep links and browser refreshes work correctly.
 app.get('*', limiter, (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
